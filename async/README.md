@@ -64,6 +64,16 @@ The function template ```std::async``` runs the function f asynchronously (poten
 
 ```std::async``` can conceptually (this is not mandated by the standard) understood as a function that creates a ```std::promise```, pushes that into a thread pool (of sorts, might be a thread pool, might be a new thread, ...) and returns the associated ```std::future``` to the caller. On the client side you would wait on the ```std::future``` and a thread on the other end would compute the result and store it in the ```std::promise```. Note: the standard requires the shared state and the ```std::future``` but not the existence of a ```std::promise``` in this particular use case.
 
+There were two main arguments that caused the current design where ```~std::future``` blocks **if the future was
+produced by ```std::async```**.
+
+1. First, it was felt that because the returned future was the only handle to the async operation, if it did not
+block then there would be no way to join with the async operation, leading to a detached task that could
+run beyond the end of main off into static destruction time, which was considered anathema.
+
+2. Similarly, it was felt that it was too easy for a lambda spawned by an async operation to capture a local
+variable by reference but then outlive the function.
+
 One (incomplete) way to implement ```std::async``` using ```std::promise``` could be:
 
 ```
@@ -107,6 +117,8 @@ auto async(F&& func) -> std::future<decltype(func())>
 ```
 
 Without ```std::future``` and ```std::async```, you would normally need a ```std::mutex``` and modify shared data in order to return a result from the thread. With ```std::async``` and ```std::future``` this is not needed at all and very easy.
+
+```std::async``` is the default launcher and the cornerstone of composability.
 
 Two policies:
 
@@ -284,6 +296,30 @@ The thread starts running immediately. We can either detach it, or have join it 
 int res = fut.get();
 ```
 
+#
+
+```
+std::function<int(int,int)> f { add };
+```
+
+Once we have f, we can execute it, in the same thread, like:
+
+```
+int result = f(1, 2); //note we can get the result here
+```
+
+Or, in a different thread, like this:
+
+```
+std::thread t { std::move(f), 3, 4 };
+t.join(); 
+```
+If we see carefully, we realize that executing ```f``` in a different thread creates a new problem: how do we get the result of the function? Executing ```f``` in the same thread does not have that problem — we get the result as returned value, but when executed it in a different thread, we don't have any way to get the result. **That is exactly what is solved by ```std::packaged_task```**.
+
+Fundamentally ```std::function``` and ```std::packaged_task``` are similar kind of thing: they simply wrap callable entity, with one difference: ```std::packaged_task``` is multithreading-friendly, because it provides a channel through which it can pass the result to other threads. Both of them do **NOT** execute the wrapped callable entity by themselves. One needs to invoke them, either in the same thread, or in another thread, to execute the wrapped callable entity. So basically there are two kinds of thing in this space:
+
+- what is executed i.e regular functions, ```std::function```, ```std::packaged_task```, etc.
+- how/where is executed i.e threads, thread pools, executors, etc.
 
 ## Example std::packaged_task Implementation
 
@@ -343,6 +379,17 @@ When and where the task actually gets executed is none of packaged_task's busine
 - ```std::promise``` can only set the value; it can't even get it back. 
 - ```std::future``` can only get the value; it cannot set it. Therefore, we have an asymmetric interface.
 
+#
+
+C++11 futures are the caller's end of a communications channel that begins with a callee that's (typically) called asynchronously. When the called function has a result to communicate to its caller, it performs a set operation on the ```std::promise``` corresponding to the future.  That is, an asynchronous callee sets a promise (i.e., writes a result to the communication channel between it and its caller), and its caller gets the future (i.e., reads the result from the communications channel).
+
+#
+
+Between the time a callee sets its promise and its caller does a corresponding get, an arbitrarily long time may elapse. (In fact, the get may never take place, but that's a detail I'm ignoring.) As a result, the std::promise object that was set may be destroyed before a get takes place.  This means that the value with which the callee sets the promise can't be stored in the promise--the promise may not have a long enough lifetime.  The value also can't be stored in the future corresponding to the promise, because the std::future returned from std::async could be moved into a std::shared_future before being destroyed, and the std::shared_future could then be copied many times to new objects, some of which would subsequently be destroyed. In that case, which future would hold the value returned by the callee?
+
+Because neither the promise nor the future ends of the communications channel between caller and callee are suitable for storing the result of an asynchronously invoked function, it's stored in a neutral location. This location is known as the **shared state**.  There's nothing in the C++ standard library corresponding to the shared state.  No class, no type, no function. In practice, I'm guessing it's implemented as a class that's templatized on at least the type of the result to be communicated between callee and caller.
+
+
 ## std::future
 
 ```std::future``` waits for a value that is set asynchronously.
@@ -354,6 +401,7 @@ The class template ```std::future``` provides a mechanism to access the result o
 - When the asynchronous operation is ready to send a result to the creator, it can do so by modifying shared state (e.g. ```std::promise::set_value```) that is **linked to** the creator's ```std::future```.
 - ```std::future``` references shared state that is **not** shared with any other asynchronous return objects (as opposed to ```std::shared_future```).
 
+- The good news is that the Standard’s specification of future and shared_future destructors specifies that they never block. This is vital. The bad news is that the Standard specifies that the associated state of an operation launched by ```std::async (only!)``` does nevertheless cause future destructors to block.
 
 ## std::promise
 
@@ -528,9 +576,11 @@ https://stackoverflow.com/questions/25878765/stdpromise-and-stdfuture-in-c?nored
 
 https://stackoverflow.com/questions/63843676/why-stdfuture-is-different-returned-from-stdpackaged-task-and-stdasync?noredirect=1&lq=1 --> this seems like a cool question.
 
+https://stackoverflow.com/questions/37362865/why-is-stdasync-slow-compared-to-simple-detached-threads?noredirect=1&lq=1
 
+https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2012/n3451.pdf
 
-
+https://scottmeyers.blogspot.com/2013/03/stdfutures-from-stdasync-arent-special.html
 
 
 
